@@ -1,0 +1,306 @@
+\documentclass[UTF8,zihao=-4]{ctexart}
+\usepackage[a4paper,margin=2.2cm]{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!55!black,
+  urlcolor=blue!55!black
+}
+
+\setlist[itemize]{leftmargin=1.8em,itemsep=0.2em,topsep=0.3em}
+\setlist[enumerate]{leftmargin=2em,itemsep=0.2em,topsep=0.3em}
+\renewcommand{\arraystretch}{1.25}
+
+\title{\heiti 机器学习股票预测策略完整判断流程说明}
+\author{策略代码：\texttt{code/src/predict.py}}
+\date{生成日期：2026年5月25日}
+
+\begin{document}
+\maketitle
+
+\section{策略目标}
+
+本策略的目标不是单纯选出模型分数最高的五只股票，而是在模型预测分数的基础上叠加市场主题、科技子板块强弱、价格形态、量能换手、风险剔除和组合权重控制，形成更接近实盘选股逻辑的五股票组合。
+
+当前策略重点解决三个问题：
+
+\begin{enumerate}
+  \item 识别当前科技主线是否强于全市场，并把资金更多分配给强科技分支。
+  \item 避免只因为主题相似而买入高位放量退潮票。
+  \item 在强主题和模型原始预测之间做平衡，保留少量非主题高模型分数票作为分散。
+\end{enumerate}
+
+\section{整体流程}
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.85cm,
+  box/.style={rectangle, rounded corners=2pt, draw=black!55, align=center, minimum width=9.5cm, minimum height=0.78cm},
+  arrow/.style={-{Latex[length=2.2mm]}, thick, draw=black!65}
+]
+\node[box] (data) {读取历史行情数据，按预测日截断，避免模型输入偷看未来};
+\node[box, below=of data] (feature) {特征工程：158+39 技术特征，按训练时 scaler 标准化};
+\node[box, below=of feature] (model) {Transformer 模型输出每只股票的 \texttt{model\_score}};
+\node[box, below=of model] (signals) {构造截面信号：趋势、波动、RSI、支撑、阻力、量能、换手、主题相似度};
+\node[box, below=of signals] (theme) {识别科技攻击池、科技子板块强度、全局科技 regime};
+\node[box, below=of theme] (risk) {风险过滤：破位、阻力陷阱、实时破位、放量高换手派发};
+\node[box, below=of risk] (rank) {加权合成 \texttt{adjusted\_score} 并排序};
+\node[box, below=of rank] (portfolio) {选五只股票，按 softmax 分配权重，并执行单票上限};
+\draw[arrow] (data) -- (feature);
+\draw[arrow] (feature) -- (model);
+\draw[arrow] (model) -- (signals);
+\draw[arrow] (signals) -- (theme);
+\draw[arrow] (theme) -- (risk);
+\draw[arrow] (risk) -- (rank);
+\draw[arrow] (rank) -- (portfolio);
+\end{tikzpicture}
+\end{center}
+
+\section{数据使用口径}
+
+\subsection{正式预测口径}
+
+正式预测时，策略使用数据文件中的最新交易日作为预测日。模型序列、个股价格特征、成交额、换手率、主题相似度、科技强弱和风险信号都基于预测日及之前的数据计算。
+
+如果 AkShare 实时行情可用，策略会额外加入实时涨跌幅、成交额、换手率、量比和实时破位判断。如果实时行情不可用，则自动退化为仅使用历史信号。
+
+\subsection{回测口径}
+
+单窗口回测可以指定：
+
+\begin{itemize}
+  \item 预测日：例如 2026-04-24，只允许模型和个股信号看到该日及以前。
+  \item 买入日：例如 2026-04-27，使用开盘价买入。
+  \item 卖出日：例如 2026-04-30，使用开盘价卖出。
+  \item 主题画像口径：可以严格只用预测日以前，也可以用指定月份的主题画像。若使用 5 月主题画像，本质是把「五月主线偏好」作为外部先验，但个股走势信号仍不看买入后的答案。
+\end{itemize}
+
+\section{股票池与主题划分}
+
+\subsection{主题种子池}
+
+主题画像使用若干代表性股票作为种子，覆盖电网设备、通信、电池、机器人等成长方向。种子股票用于拟合当前主题行情的价格形态均值和尺度。
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{3.5cm} p{10cm}}
+\toprule
+主题 & 代表股票 \\
+\midrule
+电网设备 & 600406、002028、600089、600312 \\
+通信 & 300308、300502、000063、300394、601138 \\
+电池 & 300750、300014 \\
+机器人 & 002050、300124 \\
+\bottomrule
+\end{longtable}
+
+\subsection{科技攻击池}
+
+科技攻击池用于识别更有进攻性的科技线，包括半导体设备、芯片设计、晶圆制造材料、AI 硬件和通信硬件。代码中进一步拆成四个科技子板块：
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{3.5cm} p{10cm}}
+\toprule
+子板块 & 股票 \\
+\midrule
+AI 硬件与通信 & 300308、300502、300394、300476、601138、000063 \\
+半导体设备 & 002371、688012、688008 \\
+芯片设计 & 688041、603501、603986、300782、002049、688256 \\
+晶圆制造与材料 & 688981、600584、688126、688396 \\
+\bottomrule
+\end{longtable}
+
+\section{个股基础信号}
+
+每只股票基于预测日前的历史开盘价序列计算以下信号：
+
+\begin{itemize}
+  \item 短期收益：\texttt{ret\_3}、\texttt{ret\_5}、\texttt{ret\_10}、\texttt{ret\_20}。
+  \item 波动率：最近 20 日日收益标准差 \texttt{vol\_20}。
+  \item 均线偏离：相对 5 日、20 日、60 日均线的位置。
+  \item 回撤和支撑：相对 20 日、60 日高点的回撤，以及相对 20 日低点的支撑距离。
+  \item RSI：14 日 RSI，归一化到 0 到 1。
+  \item 超跌反弹：识别没有破位但处于短期超跌、接近支撑、短线企稳的股票。
+  \item 阻力陷阱：识别接近阶段高点、涨幅较大、短线动能回落、RSI 偏高的股票。
+\end{itemize}
+
+\section{主题画像与主题相似度}
+
+策略先对主题种子股票计算一组价格形态特征，包括短期收益、波动率、均线偏离、回撤、支撑距离、RSI 和超跌反弹状态。随后求出种子股票的均值向量和尺度向量，形成主题画像。
+
+任意股票的主题相似度定义为：
+
+\[
+\text{theme\_similarity} =
+\frac{1}{1 + \sqrt{\operatorname{mean}\left(\left(\frac{x - \mu}{\sigma}\right)^2\right)}}
+\]
+
+其中 $x$ 是该股票的价格形态特征，$\mu$ 是主题画像均值，$\sigma$ 是主题画像尺度。相似度越高，说明它的形态越接近当前主题种子。
+
+\section{科技强度判断}
+
+\subsection{个股科技动量}
+
+科技股票额外计算 \texttt{tech\_momentum\_score}。该分数综合：
+
+\begin{itemize}
+  \item 5 日、10 日、20 日收益；
+  \item 是否接近 20 日高点并有突破质量；
+  \item 是否满足 10 日均线高于 20 日均线；
+  \item 近 5 日成交额是否明显高于前 15 日；
+  \item 是否短线急跌或 RSI 过热。
+\end{itemize}
+
+\subsection{全局科技 regime}
+
+科技攻击池整体是否强于全市场，由以下三项决定：
+
+\[
+\text{tech\_regime} =
+\overline{r_{5,\ tech}} - \overline{r_{5,\ all}}
++ 0.6 \cdot \left(P(r_{5,\ tech}>0)-P(r_{5,\ all}>0)\right)
++ 0.25 \cdot \overline{\text{tech\_momentum}}
+\]
+
+当 \texttt{tech\_regime > 0} 时，组合会把目标成长仓位提高到 \texttt{tech\_total\_weight = 0.82}；否则使用较保守的 \texttt{quiet\_tech\_total\_weight = 0.62}。
+
+\subsection{科技子板块强度}
+
+每个科技子板块单独计算相对全市场的 5 日收益优势、上涨占比优势和科技动量均值。强子板块内的股票会获得额外加分，弱子板块不会因为同属科技而被无条件抬高。
+
+\section{风险识别与剔除}
+
+\subsection{破位风险}
+
+若个股跌破 20 日低点、明显低于 60 日均线，或接近 60 日低点且 20 日收益明显为负，会触发 \texttt{breakdown}。触发后该股 \texttt{adjusted\_score} 扣 3 分。
+
+\subsection{阻力陷阱}
+
+阻力陷阱用于识别高位附近动能衰减的股票。信号包括：
+
+\begin{itemize}
+  \item 接近 20 日或 60 日高点；
+  \item 相对 20 日或 60 日均线涨幅过大；
+  \item 3 日、5 日动能减弱；
+  \item 5 日收益明显弱于 10 日收益；
+  \item RSI 偏高。
+\end{itemize}
+
+阻力分 \texttt{resistance\_score} 会按 \texttt{resistance\_penalty\_weight = 0.85} 扣分；若达到陷阱阈值，则额外扣 1.2 分并从优先候选池剔除。
+
+\subsection{放量高换手派发风险}
+
+这是针对 300394 案例新增的关键风控。它识别「高位、放量、高换手、连续大阴回落」这类可能退潮的股票。
+
+派发风险 \texttt{distribution\_risk} 的规则如下：
+
+\begin{longtable}{p{10cm} p{3cm}}
+\toprule
+条件 & 风险加分 \\
+\midrule
+3 日收益低于 -2.5\%，且 5 日成交额均值高于 20 日均值 10\% 以上 & +0.45 \\
+5 日收益低于 -4\%，且 5 日换手率均值高于 20 日均值 15\% 以上 & +0.35 \\
+当前价低于 5 日均线 2\% 以上，且 20 日收益仍高于 5\% & +0.25 \\
+20 日波动率高于 3.5\%，且成交额仍放大 & +0.15 \\
+5 日收益低于 -6\% & +0.20 \\
+\bottomrule
+\end{longtable}
+
+总风险最高截断到 1.25。当风险分达到 0.75 及以上时，触发 \texttt{distribution\_trap}，该股票从优先候选池剔除，并额外扣 1 分。
+
+\section{综合打分公式}
+
+最终排序分 \texttt{adjusted\_score} 的主体为：
+
+\[
+\begin{aligned}
+\text{adjusted\_score} =\;&
+1.00 \cdot z(\text{model\_score})
++ 0.18 \cdot z(r_5)
++ 0.22 \cdot z(r_{20}) \\
+&- 0.16 \cdot z(\text{vol}_{20})
++ 0.35 \cdot \text{oversold\_rebound}
++ 1.15 \cdot z(\text{theme\_similarity}) \\
+&+ 0.35 \cdot I(\text{core\_growth})
++ 0.85 \cdot I(\text{tech\_attack}) \\
+&+ 0.45 \cdot z(\text{tech\_momentum}) \cdot I(\text{tech\_attack}) \\
+&+ 0.55 \cdot \text{tech\_regime} \cdot I(\text{tech\_attack}) \\
+&+ 0.85 \cdot \text{tech\_subsector\_strength} \cdot I(\text{tech\_attack})
+\end{aligned}
+\]
+
+随后叠加以下扣分：
+
+\[
+\begin{aligned}
+\text{adjusted\_score} \mathrel{-}= &\; 3.0 \cdot I(\text{breakdown}) \\
+&+ 1.5 \cdot I(\text{rt\_breakdown}) \\
+&+ 0.85 \cdot \text{resistance\_score}
++ 1.2 \cdot I(\text{resistance\_trap}) \\
+&+ 1.15 \cdot \text{distribution\_risk}
++ 1.0 \cdot I(\text{distribution\_trap})
+\end{aligned}
+\]
+
+\section{组合构建规则}
+
+\begin{enumerate}
+  \item 先过滤掉 \texttt{breakdown}、\texttt{rt\_breakdown}、\texttt{resistance\_trap}、\texttt{distribution\_trap} 的股票。
+  \item 若过滤后不足五只，则逐级放松过滤条件，保证可输出组合。
+  \item 在前 120 个高 \texttt{adjusted\_score} 股票中，优先选择 3 只成长主题候选。
+  \item 再用模型原始分数排名补足到 5 只，避免主题因子完全覆盖模型判断。
+  \item 对五只股票按 \(\exp(\text{score}/0.75)\) 计算初始权重。
+  \item 若成长主题股和非主题股同时存在，则成长主题总仓位按 \texttt{target\_growth\_weight} 分配。
+  \item 单只成长股权重上限为 35\%，非核心股权重上限为 15\%。
+  \item 权重四舍五入到 4 位小数，并修正最后的舍入误差，使总权重为 1。
+\end{enumerate}
+
+\section{300394 案例说明}
+
+在 2026-04-24 截面，300394 的主题属性较强，且属于 AI 硬件与通信子板块。如果只看 5 月主题画像，它会被推入组合。但该股当时已经出现明显风险信号：
+
+\begin{longtable}{p{7cm} p{5cm}}
+\toprule
+信号 & 数值 \\
+\midrule
+2026-04-23 单日涨跌幅 & -6.74\% \\
+2026-04-24 单日涨跌幅 & -7.49\% \\
+近 5 日收益 & -5.41\% \\
+近 20 日收益 & +7.59\% \\
+5 日/20 日成交额比 & 1.28 \\
+5 日/20 日换手率比 & 1.24 \\
+\bottomrule
+\end{longtable}
+
+这些特征组合意味着它不是普通回调，而更像高位放量分歧后的退潮信号。新增派发风险后，300394 会触发较高的 \texttt{distribution\_risk}，并被排除出优先候选池。
+
+在 2026-04-24 预测、2026-04-27 开盘买入、2026-04-30 开盘卖出的测试中，替换掉 300394 后，组合加入 688012，收益率由约 +1.02\% 提升到约 +3.22\%。
+
+\section{当前策略输出文件}
+
+正式运行 \texttt{python code/src/predict.py} 后，主要输出：
+
+\begin{itemize}
+  \item \texttt{output/result.csv}：最终五只股票和权重。
+  \item \texttt{output/selection\_details.csv}：入选股票的完整信号和权重。
+  \item \texttt{output/signal\_scores.csv}：全部候选股票的信号分数。
+  \item \texttt{output/theme\_profile\_seeds.csv}：主题画像种子股票特征。
+\end{itemize}
+
+\section{策略边界}
+
+\begin{itemize}
+  \item 当前策略仍是规则增强型模型组合，不保证未来收益。
+  \item 科技主题画像如果使用未来月份信息，只适合作为研究或外部先验模拟，不能算严格无未来函数回测。
+  \item 新增派发风险能过滤类似 300394 的高位放量退潮票，但也可能错杀洗盘后继续上涨的强势票。
+  \item 最终应继续用更多月份、多窗口、不同市场环境验证参数稳定性。
+\end{itemize}
+
+\end{document}
